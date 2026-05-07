@@ -1,0 +1,57 @@
+AI Agent Product Architecture & Design Guidelines
+1. Core Philosophy
+The architecture of this Agent system does not rely on infinitely long conversational contexts. Instead, it prioritizes persistence, robustness, and extreme decoupling.
+Action over Prose: The system prompt strictly enforces "Act, don't explain"
+. This minimizes token waste, prevents hallucination through overly long reasoning, and restricts the AI to being a pure execution engine.
+Decoupling State from Context: The model is allowed to forget (via context compaction) because the true state of the system (tasks, files, dependencies) persists physically outside the conversation
+.
+2. Foundation: Loop, Tools & Security
+The Decision Loop: The heart of the agent is a while loop that continuously executes as long as the model's stop_reason is "tool_use"
+. Tool execution results must always be fed back into the context to ground the model in reality.
+Registry-Based Dispatch: Complex logic should never live inside the loop. The system uses a TOOL_HANDLERS dispatch map to route LLM tool calls to isolated Python functions
+.
+Defensive Execution:
+Hardcoded Boundaries: Dangerous commands (like rm -rf /, sudo, shutdown) are blocked at the physical execution layer, completely independent of the LLM's prompt instructions
+.
+Output Truncation: Tool outputs (like bash logs or file reads) are strictly truncated (e.g., to 50,000 characters) to prevent unhandled logs from blowing up the context window
+.
+3. Memory & Context Management
+LLM context windows are expensive and suffer from attention degradation. "Strategic forgetting" is required for infinite agent sessions
+.
+Short-Term Tracking (Nag Reminder): The model is forced to maintain a multi-step plan using a TodoManager
+. If the model works heads-down for 3 consecutive rounds without updating its checklist, the system automatically injects a nag reminder ("Update your todos.") to force self-reflection and realignment
+.
+Three-Layer Compression Pipeline
+:
+Micro-compact: Silently replaces old, noisy tool results (except critical reference materials like read_file) with a brief placeholder ([Previous: used bash]) on every turn.
+Auto-compact: When token limits are approached, the system saves the full transcript to disk, asks the LLM to summarize the current state and key decisions, and replaces the massive history with that single summary.
+Two-Layer Skill Injection: Standard operating procedures (SOPs) are not stuffed into the system prompt. Layer 1 injects only lightweight metadata (skill names and brief descriptions). Layer 2 loads the full Markdown body on-demand only when the agent explicitly calls the load_skill tool
+.
+4. Async & Long-Running Orchestration
+Persistent Dependency Graphs: Long-running goals are saved as individual JSON files in a .tasks/ directory
+. Using a blockedBy array, the system models a Directed Acyclic Graph (DAG) workflow, automatically unblocking downstream tasks when upstream prerequisites are marked "completed"
+.
+Fire-and-Forget Background Tasks: For time-consuming operations (e.g., massive web scraping or running test suites), the agent spawns a background thread and immediately receives a task_id
+. Once the thread finishes, the result is pushed to a notification queue and secretly injected into the context right before the agent's next LLM call
+.
+5. Multi-Agent Organization & Protocols
+Transitioning from a single tool-caller to a "virtual company."
+Physical Context Isolation: Subagents are spawned with a fresh context (messages=[]). "Process isolation gives context isolation for free"
+. Once a subagent finishes, it returns only a summary, shielding the parent agent from context pollution
+.
+JSONL Team Mailboxes: Teammates run on separate threads and communicate via append-only .jsonl files (inboxes)
+. This provides asynchronous messaging and built-in audit trails.
+State Machine Protocols (request_id Correlation): Complex asynchronous interactions are tracked using unique request_ids
+.
+Human-in-the-loop / Plan Approvals: Before taking major actions, agents must submit a plan and wait for a plan_approval_response from the Lead Agent (or a human manager)
+.
+Autonomous Worker Paradigm: Agents are not blindly pushed tasks. They are given an IDLE phase
+. While idle, they poll the system every few seconds. If they find an unclaimed task with no unfulfilled dependencies on the shared board, they automatically claim it
+. Upon claiming, an Identity Re-injection block is pushed into their context so they don't forget their role after waking up from compression
+.
+6. Sandbox & Safe Exploration
+Control Plane vs. Execution Plane: Tasks represent the control plane; Worktrees represent the execution plane
+.
+Git Worktree Isolation: To prevent the AI from breaking the main branch during risky code modifications, the system binds tasks to dynamically generated Git Worktrees (isolated directories on separate branches)
+. The agent's bash commands are hard-routed to execute only inside this sandbox
+. Once the tests pass, the worktree can be kept and merged; if the AI hallucinates unrecoverable code, the worktree is safely deleted
