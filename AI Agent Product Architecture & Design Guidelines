@@ -55,3 +55,60 @@ Control Plane vs. Execution Plane: Tasks represent the control plane; Worktrees 
 Git Worktree Isolation: To prevent the AI from breaking the main branch during risky code modifications, the system binds tasks to dynamically generated Git Worktrees (isolated directories on separate branches)
 . The agent's bash commands are hard-routed to execute only inside this sandbox
 . Once the tests pass, the worktree can be kept and merged; if the AI hallucinates unrecoverable code, the worktree is safely deleted
+.
+
+AI Agent 产品架构与设计规范指南
+1. 核心设计哲学 (Core Philosophy)
+本产品的 Agent 架构不追求单次对话的无限长，而是追求系统的持久性、鲁棒性与高度解耦。
+行动胜于言辞：在系统提示词中强制设定 “直接行动，不要解释” (Act, don't explain)
+。减少冗余输出，节约 Token，将 AI 约束为纯粹的执行器。
+物理状态与对话上下文解耦：模型可以遗忘（Context），但系统的物理状态（文件、数据库）永存
+。
+2. 基础架构层：循环、工具与安全 (Foundation)
+决策死循环 (The Loop)：Agent 的核心是一个只要触发 tool_use 就无限运转的反馈循环
+。工具执行的真实结果必须作为上下文再次喂给模型
+。
+基于注册表的工具调度 (Dispatch Map)：千万不要把庞杂的业务逻辑写在循环体中，必须采用路由映射表结构（如 TOOL_HANDLERS 字典）来实现能力插件化
+。
+防御性底线 (Defensive Execution)：
+权限拦截：在物理层（而非提示词层）硬编码拦截 rm -rf /、sudo 等高危操作
+。
+防爆截断：工具返回的结果必须强制截断（例如最多保留 50000 字符），防止不可控的日志输出撑爆模型的上下文窗口
+。
+3. 记忆与上下文管理层 (Memory & Context)
+大模型的 Token 极其昂贵且注意力有限，“战略性遗忘”是让 Agent 永续运行的关键
+。
+短期进度追踪 (Nag Reminder)：强制模型使用类似 TodoWrite 的工具维护任务清单。如果模型连续 3 轮埋头调用底层工具而忘记更新进度，系统必须强行注入提示（如 "Update your todos."）打断并纠偏
+。
+三级压缩管线 (Compression Pipeline)：
+微压缩：每轮静默把过老的工具日志替换为简短的占位符（如 [Previous: used bash]）
+。
+自动/手动全局压缩：当 Token 逼近阈值时，自动将全量对话落盘备份为 .jsonl 快照，然后让 LLM 生成摘要（Summary），用单句摘要替换掉长篇大论的对话历史
+。
+动态技能加载 (Two-layer Skill Injection)：不要把所有 SOP 塞进 System Prompt。第一层只在 Prompt 注入极简的技能名称和描述（占 ~100 Token）；第二层通过工具按需加载完整的 Markdown 知识库
+。
+4. 异步与长程任务调度层 (Async & Tasks)
+长效任务持久化 (Persistent Tasks)：使用外部文件系统（或数据库）而非聊天历史来存储任务的流转状态
+。引入基于 ID 的依赖图（blockedBy 字段），完成前置任务后自动解锁后续工单
+。
+发射后不管 (Fire and Forget)：遇到耗时操作，主线程绝不能阻塞
+。开辟后台线程执行，立刻给模型返回一个 task_id，模型可继续思考；后台完成后，将结果推入通知队列，在下一次循环前悄悄塞入大模型的上下文中
+。
+5. 多智能体组织与协议层 (Teams & Protocols)
+从“单体工具包”走向“虚拟公司编制”。
+上下文物理隔离：给子智能体分配新任务时，必须清空对话历史。“进程隔离免费带来了上下文隔离”
+。子智能体干完活后，只允许向主干返回一段摘要文本，丢弃执行过程
+。
+基于文件的消息总线 (Team Mailboxes)：成员间通过追加写入 .jsonl 文件进行通信，每个成员有一个独立的工作线程
+。这既实现了异步削峰，又自带审计日志。
+强相关性状态机 (request_id Correlation)：在复杂的异步交互中，通过生成唯一 request_id 进行事务绑定
+。
+Human-in-the-loop / 计划审批：敏感操作（Plan）必须通过审批流状态机（提交 -> 等待 -> 主管或人类批准 -> 执行）
+。
+高阶自治 (Autonomous)：智能体不需要被持续 Push。赋予它们“空闲状态 (IDLE)”。在空闲时，它们每隔几秒扫描一次全局任务看板，发现前置条件已满足的无主任务就主动抢单 (auto-claim)，并在接单后强制重注入一次“角色记忆 (Identity re-injection)”以防失忆
+。
+6. 安全沙盒与隔离执行层 (Sandbox)
+控制面与执行面分离：任务是控制面，工作区是执行面
+。
+物理级试错（Git Worktree Isolation）：针对高危或探索性代码编写任务，必须通过目录隔离，并在后台为该任务分配一个独立分支（Worktree）
+。在沙盒中跑通测试后，再选择保留（Keep）或丢弃，绝不能让 AI 盲目修改主干数据。
